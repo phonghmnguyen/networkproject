@@ -47,7 +47,6 @@ type Client struct {
 	serverAddr     *net.UDPAddr
 	conn           *net.UDPConn
 	sequenceNumber uint32
-	messages       map[uint32][]byte
 	mu             sync.Mutex
 }
 
@@ -66,7 +65,6 @@ func NewClient(serverHost string, serverPort int) (*Client, error) {
 		serverAddr:     serverAddr,
 		conn:           conn,
 		sequenceNumber: 0,
-		messages:       make(map[uint32][]byte),
 	}, nil
 }
 
@@ -74,7 +72,6 @@ func (c *Client) SendMessage(payload []byte) error {
 	c.mu.Lock()
 	seqNum := c.sequenceNumber
 	c.sequenceNumber++
-	c.messages[seqNum] = payload
 	c.mu.Unlock()
 
 	msg := Message{
@@ -85,7 +82,7 @@ func (c *Client) SendMessage(payload []byte) error {
 
 	encodedMsg := encodeMessage(msg)
 	maxRetries := 3
-	timeout := time.Second * 2
+	timeout := time.Second * 5
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		_, err := c.conn.Write(encodedMsg)
@@ -145,9 +142,9 @@ func (s *Server) Start() {
 
 func (s *Server) handleMessage(data []byte, remoteAddr *net.UDPAddr) {
 	msg := decodeMessage(data)
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if _, ok := s.receivedSeqNos[msg.SequenceNumber]; !ok {
 		s.receivedSeqNos[msg.SequenceNumber] = struct{}{}
 		log.Printf("Received message: Seq=%d, Payload=%s",
@@ -161,32 +158,35 @@ func (s *Server) handleMessage(data []byte, remoteAddr *net.UDPAddr) {
 
 // Proxy Server implementation
 type ProxyServer struct {
-	sourceAddr            *net.UDPAddr
-	destinationAddr       *net.UDPAddr
+	targetConn            *net.UDPConn
 	conn                  *net.UDPConn
 	packetLossProbability float64
 	maxDelay              time.Duration
 }
 
-func NewProxyServer(sourcePort, destPort int, lossProbability float64, maxDelay time.Duration) (*ProxyServer, error) {
-	sourceAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", sourcePort))
+func NewProxyServer(port int, targetHost string, targetPort int, lossProbability float64, maxDelay time.Duration) (*ProxyServer, error) {
+	targetAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", targetHost, targetPort))
 	if err != nil {
 		return nil, err
 	}
 
-	destinationAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("localhost:%d", destPort))
+	targetConn, err := net.DialUDP("udp", nil, targetAddr)
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := net.ListenUDP("udp", sourceAddr)
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		return nil, err
 	}
 
 	return &ProxyServer{
-		sourceAddr:            sourceAddr,
-		destinationAddr:       destinationAddr,
+		targetConn:            targetConn,
 		conn:                  conn,
 		packetLossProbability: lossProbability,
 		maxDelay:              maxDelay,
@@ -196,53 +196,62 @@ func NewProxyServer(sourcePort, destPort int, lossProbability float64, maxDelay 
 func (p *ProxyServer) Start() {
 	buffer := make([]byte, 1024)
 	for {
-		n, _, err := p.conn.ReadFromUDP(buffer)
+		n, remoteAddr, err := p.conn.ReadFromUDP(buffer)
 		if err != nil {
 			log.Println("Proxy read error:", err)
 			continue
 		}
 
-		go p.forwardPacket(buffer[:n])
+		go p.forwardPacket(buffer[:n], remoteAddr)
 	}
 }
 
-func (p *ProxyServer) forwardPacket(data []byte) {
+func (p *ProxyServer) forwardPacket(data []byte, remoteAddr *net.UDPAddr) {
 	// Simulate network conditions
 	if rand.Float64() < p.packetLossProbability {
-		log.Println("Packet dropped")
+		log.Println("Packet to server dropped")
 		return
 	}
-
-	delay := time.Duration(rand.Intn(int(p.maxDelay))) * time.Millisecond
-	time.Sleep(delay)
-
-	// Create a connection to the destination server
-	conn, err := net.DialUDP("udp", nil, p.destinationAddr)
-	if err != nil {
-		log.Println("Proxy forward connection error:", err)
-		return
-	}
-	defer conn.Close()
 
 	// Actually forward the packet to the destination server
-	_, err = conn.Write(data)
+	_, err := p.targetConn.Write(data)
 	if err != nil {
 		log.Println("Proxy packet forwarding error:", err)
+		return
+	}
+
+	buffer := make([]byte, 1024)
+	n, _, err := p.targetConn.ReadFromUDP(buffer)
+	if err != nil {
+		log.Println("Proxy packet forwarding error:", err)
+		return
+	}
+
+	if rand.Float64() < p.packetLossProbability {
+		log.Println("Packet to client dropped")
+		return
+	}
+
+	_, err = p.conn.WriteToUDP(buffer[:n], remoteAddr)
+	if err != nil {
+		log.Println("Proxy packet forwarding error:", err)
+		return
 	}
 }
 
 // Example main function demonstrating usage
 func main() {
 	mode := flag.String("mode", "", "Mode: client, server, or proxy")
-	host := flag.String("host", "localhost", "Host address")
 	port := flag.Int("port", 8080, "Port number")
+	serverHost := flag.String("host", "localhost", "Host address")
 	serverPort := flag.Int("server-port", 8081, "Server port for proxy")
-	lossProbability := flag.Float64("loss", 0.1, "Packet loss probability")
+	lossProbability := flag.Float64("loss", 0.3, "Packet loss probability")
 	flag.Parse()
 
 	switch *mode {
 	case "client":
-		client, err := NewClient(*host, *port)
+		fmt.Println("Starting client")
+		client, err := NewClient(*serverHost, *serverPort)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -257,6 +266,7 @@ func main() {
 
 			// Exit condition
 			if message == "exit" {
+				fmt.Println("Exiting client")
 				break
 			}
 
@@ -274,6 +284,7 @@ func main() {
 		}
 
 	case "server":
+		fmt.Println("Starting server")
 		server, err := NewServer(*port)
 		if err != nil {
 			log.Fatal(err)
@@ -281,7 +292,8 @@ func main() {
 		server.Start()
 
 	case "proxy":
-		proxy, err := NewProxyServer(*port, *serverPort, *lossProbability, time.Second)
+		fmt.Println("Starting proxy")
+		proxy, err := NewProxyServer(*port, *serverHost, *serverPort, *lossProbability, time.Second)
 		if err != nil {
 			log.Fatal(err)
 		}
