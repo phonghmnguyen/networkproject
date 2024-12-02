@@ -154,10 +154,10 @@ type ProxyServer struct {
 	conn       *net.UDPConn
 
 	packetDropInbound, packetDropOutbound, delayInbound, delayOutbound float64
-	maxDelayTimeInbound, maxDelayTimeOutbound                          time.Duration
+	delayTimeInbound, delayTimeOutbound                                time.Duration
 }
 
-func NewProxyServer(ip string, port int, targetIP string, targetPort int, packetDropInbound, packetDropOutbound, delayInbound, delayOutbound float64, maxDelayTimeInbound, maxDelayTimeOutbound time.Duration) (*ProxyServer, error) {
+func NewProxyServer(ip string, port int, targetIP string, targetPort int, packetDropInbound, packetDropOutbound, delayInbound, delayOutbound float64, delayTimeInbound, delayTimeOutbound time.Duration) (*ProxyServer, error) {
 	targetAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", targetIP, targetPort))
 	if err != nil {
 		return nil, err
@@ -179,14 +179,14 @@ func NewProxyServer(ip string, port int, targetIP string, targetPort int, packet
 	}
 
 	return &ProxyServer{
-		targetConn:           targetConn,
-		conn:                 conn,
-		packetDropInbound:    packetDropInbound,
-		packetDropOutbound:   packetDropOutbound,
-		delayInbound:         delayInbound,
-		delayOutbound:        delayOutbound,
-		maxDelayTimeInbound:  maxDelayTimeInbound,
-		maxDelayTimeOutbound: maxDelayTimeOutbound,
+		targetConn:         targetConn,
+		conn:               conn,
+		packetDropInbound:  packetDropInbound,
+		packetDropOutbound: packetDropOutbound,
+		delayInbound:       delayInbound,
+		delayOutbound:      delayOutbound,
+		delayTimeInbound:   delayTimeInbound,
+		delayTimeOutbound:  delayTimeOutbound,
 	}, nil
 }
 
@@ -212,8 +212,7 @@ func (p *ProxyServer) forwardPacket(data []byte, remoteAddr *net.UDPAddr) {
 
 	if rand.Float64() < p.delayInbound {
 		log.Println("Inbound packet delayed")
-		delay := time.Duration(rand.Intn(int(p.maxDelayTimeInbound))) * time.Millisecond
-		time.Sleep(delay)
+		time.Sleep(p.delayTimeInbound)
 	}
 
 	// Actually forward the packet to the destination server
@@ -237,8 +236,7 @@ func (p *ProxyServer) forwardPacket(data []byte, remoteAddr *net.UDPAddr) {
 
 	if rand.Float64() < p.delayOutbound {
 		log.Println("Outbound packet delayed")
-		delay := time.Duration(rand.Intn(int(p.maxDelayTimeOutbound))) * time.Millisecond
-		time.Sleep(delay)
+		time.Sleep(p.delayTimeOutbound)
 	}
 
 	_, err = p.conn.WriteToUDP(buffer[:n], remoteAddr)
@@ -260,8 +258,8 @@ func main() {
 	serverDrop := flag.Float64("server-drop", 0.2, "Drop chance for outbound")
 	clientDelay := flag.Float64("client-delay", 0.2, "Delay chance for inbound")
 	serverDelay := flag.Float64("server-delay", 0.2, "Delay chance for outbound")
-	clientDelayTime := flag.Int64("client-delay-time", 1000, "Maximum delay time in milliseconds")
-	serverDelayTime := flag.Int64("server-delay-time", 1000, "Maximum delay time in milliseconds")
+	clientDelayTime := flag.Int64("client-delay-time", 1000, "Delay time in milliseconds")
+	serverDelayTime := flag.Int64("server-delay-time", 1000, "Delay time in milliseconds")
 	flag.Parse()
 
 	switch *mode {
