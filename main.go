@@ -51,7 +51,7 @@ type Client struct {
 	timeout        time.Duration
 }
 
-func NewClient(serverHost string, serverPort int) (*Client, error) {
+func NewClient(serverHost string, serverPort int, maxRetries int, timeout time.Duration) (*Client, error) {
 	serverAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", serverHost, serverPort))
 	if err != nil {
 		return nil, err
@@ -63,7 +63,9 @@ func NewClient(serverHost string, serverPort int) (*Client, error) {
 	}
 
 	return &Client{
-		conn: conn,
+		conn:       conn,
+		maxRetries: maxRetries,
+		timeout:    timeout,
 	}, nil
 }
 
@@ -100,8 +102,8 @@ type Server struct {
 	mu             sync.Mutex
 }
 
-func NewServer(port int) (*Server, error) {
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
+func NewServer(ip string, port int) (*Server, error) {
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", ip, port))
 	if err != nil {
 		return nil, err
 	}
@@ -155,8 +157,8 @@ type ProxyServer struct {
 	maxDelayTimeInbound, maxDelayTimeOutbound                          time.Duration
 }
 
-func NewProxyServer(port int, targetHost string, targetPort int, packetDropInbound, packetDropOutbound, delayInbound, delayOutbound float64, maxDelayTimeInbound, maxDelayTimeOutbound time.Duration) (*ProxyServer, error) {
-	targetAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", targetHost, targetPort))
+func NewProxyServer(ip string, port int, targetIP string, targetPort int, packetDropInbound, packetDropOutbound, delayInbound, delayOutbound float64, maxDelayTimeInbound, maxDelayTimeOutbound time.Duration) (*ProxyServer, error) {
+	targetAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", targetIP, targetPort))
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +168,7 @@ func NewProxyServer(port int, targetHost string, targetPort int, packetDropInbou
 		return nil, err
 	}
 
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", ip, port))
 	if err != nil {
 		return nil, err
 	}
@@ -248,29 +250,32 @@ func (p *ProxyServer) forwardPacket(data []byte, remoteAddr *net.UDPAddr) {
 
 func main() {
 	mode := flag.String("mode", "", "Mode: client, server, or proxy")
-	port := flag.Int("port", 8080, "Port number")
-	serverHost := flag.String("host", "localhost", "Host address")
-	serverPort := flag.Int("server-port", 8081, "Server port for proxy")
-	clientDrop := flag.Float64("client-drop", 0, "Packet loss probability")
-	serverDrop := flag.Float64("server-drop", 0, "Packet loss probability")
-	clientDelay := flag.Float64("client-drop", 0, "Delay probability")
-	serverDelay := flag.Float64("server-drop", 0, "Delay probability")
-	clientDelayTime := flag.Int64("client-dela-time", 0, "Maximum delay time")
-	serverDelayTime := flag.Int64("client-delay-time", 0, "Maximum delay time")
+	listenIP := flag.String("listen-ip", "0.0.0.0", "IP to bind")
+	listenPort := flag.Int("listen-port", 8081, "Port to bind")
+	targetIP := flag.String("target-ip", "0.0.0.0", "Target IP")
+	targetPort := flag.Int("target-port", 8081, "Target port")
+	maxRetries := flag.Int("max-retries", 3, "Maximum retry time")
+	timeout := flag.Int("timeout", 5, "Timeout in seconds")
+	clientDrop := flag.Float64("client-drop", 0.2, "Drop chance for inbound")
+	serverDrop := flag.Float64("server-drop", 0.2, "Drop chance for outbound")
+	clientDelay := flag.Float64("client-delay", 0.2, "Delay chance for inbound")
+	serverDelay := flag.Float64("server-delay", 0.2, "Delay chance for outbound")
+	clientDelayTime := flag.Int64("client-delay-time", 1000, "Maximum delay time in milliseconds")
+	serverDelayTime := flag.Int64("server-delay-time", 1000, "Maximum delay time in milliseconds")
 	flag.Parse()
 
 	switch *mode {
 	case "client":
-		fmt.Println("Starting client")
-		client, err := NewClient(*serverHost, *serverPort)
+		log.Println("Starting client")
+		client, err := NewClient(*targetIP, *targetPort, *maxRetries, time.Duration(*timeout)*time.Second)
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer client.conn.Close()
 
+		defer client.conn.Close()
 		// Read messages from stdin in a loop
 		scanner := bufio.NewScanner(os.Stdin)
-		fmt.Println("Enter messages (type 'exit' to quit):")
+		fmt.Println("Enter messages (type 'exit' to quit)")
 
 		for scanner.Scan() {
 			message := scanner.Text()
@@ -286,7 +291,7 @@ func main() {
 			if err != nil {
 				log.Println("Failed to send message:", err)
 			} else {
-				fmt.Println("Message sent successfully")
+				log.Println("Message sent successfully")
 			}
 		}
 
@@ -295,19 +300,24 @@ func main() {
 		}
 
 	case "server":
-		fmt.Println("Starting server")
-		server, err := NewServer(*port)
+		log.Println("Starting server")
+		server, err := NewServer(*listenIP, *listenPort)
 		if err != nil {
 			log.Fatal(err)
 		}
+
+		defer server.conn.Close()
 		server.Start()
 
 	case "proxy":
-		fmt.Println("Starting proxy")
-		proxy, err := NewProxyServer(*port, *serverHost, *serverPort, *clientDrop, *serverDrop, *clientDelay, *serverDelay, time.Duration(*clientDelayTime), time.Duration(*serverDelayTime))
+		log.Println("Starting proxy")
+		proxy, err := NewProxyServer(*listenIP, *listenPort, *targetIP, *targetPort, *clientDrop, *serverDrop, *clientDelay, *serverDelay, time.Duration(*clientDelayTime)*time.Millisecond, time.Duration(*serverDelayTime)*time.Millisecond)
 		if err != nil {
 			log.Fatal(err)
 		}
+
+		defer proxy.conn.Close()
+		defer proxy.targetConn.Close()
 		proxy.Start()
 
 	default:
