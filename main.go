@@ -9,6 +9,8 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -153,11 +155,21 @@ type ProxyServer struct {
 	targetConn *net.UDPConn
 	conn       *net.UDPConn
 
+	mu                                                                 sync.RWMutex
 	packetDropInbound, packetDropOutbound, delayInbound, delayOutbound float64
 	delayTimeInbound, delayTimeOutbound                                time.Duration
 }
 
-func NewProxyServer(ip string, port int, targetIP string, targetPort int, packetDropInbound, packetDropOutbound, delayInbound, delayOutbound float64, delayTimeInbound, delayTimeOutbound time.Duration) (*ProxyServer, error) {
+type ProxyConfig struct {
+	PacketDropInbound  *float64
+	PacketDropOutbound *float64
+	DelayInbound       *float64
+	DelayOutbound      *float64
+	DelayTimeInbound   *time.Duration
+	DelayTimeOutbound  *time.Duration
+}
+
+func NewProxyServer(ip string, port int, targetIP string, targetPort int, initialConfig *ProxyConfig) (*ProxyServer, error) {
 	targetAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", targetIP, targetPort))
 	if err != nil {
 		return nil, err
@@ -178,16 +190,68 @@ func NewProxyServer(ip string, port int, targetIP string, targetPort int, packet
 		return nil, err
 	}
 
-	return &ProxyServer{
+	ps := &ProxyServer{
 		targetConn:         targetConn,
 		conn:               conn,
-		packetDropInbound:  packetDropInbound,
-		packetDropOutbound: packetDropOutbound,
-		delayInbound:       delayInbound,
-		delayOutbound:      delayOutbound,
-		delayTimeInbound:   delayTimeInbound,
-		delayTimeOutbound:  delayTimeOutbound,
-	}, nil
+		packetDropInbound:  0.2,
+		packetDropOutbound: 0.2,
+		delayInbound:       0.2,
+		delayOutbound:      0.2,
+		delayTimeInbound:   1000 * time.Millisecond,
+		delayTimeOutbound:  1000 * time.Millisecond,
+	}
+
+	if initialConfig != nil {
+		if err := ps.UpdateConfig(*initialConfig); err != nil {
+			return nil, err
+		}
+	}
+
+	return ps, nil
+}
+
+func (p *ProxyServer) UpdateConfig(config ProxyConfig) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if config.PacketDropInbound != nil {
+		if *config.PacketDropInbound < 0 || *config.PacketDropInbound > 1 {
+			return fmt.Errorf("inbound packet drop rate must be between 0 and 1")
+		}
+		p.packetDropInbound = *config.PacketDropInbound
+	}
+
+	if config.PacketDropOutbound != nil {
+		if *config.PacketDropOutbound < 0 || *config.PacketDropOutbound > 1 {
+			return fmt.Errorf("outbound packet drop rate must be between 0 and 1")
+		}
+		p.packetDropOutbound = *config.PacketDropOutbound
+	}
+
+	if config.DelayInbound != nil {
+		if *config.DelayInbound < 0 || *config.DelayInbound > 1 {
+			return fmt.Errorf("inbound delay probability must be between 0 and 1")
+		}
+		p.delayInbound = *config.DelayInbound
+	}
+
+	if config.DelayOutbound != nil {
+		if *config.DelayOutbound < 0 || *config.DelayOutbound > 1 {
+			return fmt.Errorf("outbound delay probability must be between 0 and 1")
+		}
+		p.delayOutbound = *config.DelayOutbound
+	}
+
+	if config.DelayTimeInbound != nil {
+		p.delayTimeInbound = *config.DelayTimeInbound
+	}
+
+	if config.DelayTimeOutbound != nil {
+		p.delayTimeOutbound = *config.DelayTimeOutbound
+	}
+
+	log.Println("Proxy configuration updated")
+	return nil
 }
 
 func (p *ProxyServer) Start() {
@@ -204,6 +268,9 @@ func (p *ProxyServer) Start() {
 }
 
 func (p *ProxyServer) forwardPacket(data []byte, remoteAddr *net.UDPAddr) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
 	// Simulate network conditions
 	if rand.Float64() < p.packetDropInbound {
 		log.Println("Inbound packet dropped")
@@ -243,6 +310,87 @@ func (p *ProxyServer) forwardPacket(data []byte, remoteAddr *net.UDPAddr) {
 	if err != nil {
 		log.Println("Proxy packet forwarding error:", err)
 		return
+	}
+}
+
+func (p *ProxyServer) StartConfigListener() {
+	scanner := bufio.NewScanner(os.Stdin)
+	fmt.Println("Proxy configuration commands:")
+	fmt.Println("config <param> <value>")
+	fmt.Println("Available params: client-drop, server-drop, client-delay, server-delay, client-delay-time, server-delay-time")
+	fmt.Println("Type 'exit' to stop configuration mode")
+
+	for scanner.Scan() {
+		input := scanner.Text()
+		if input == "exit" {
+			break
+		}
+
+		parts := strings.Fields(input)
+		if len(parts) != 3 || parts[0] != "config" {
+			fmt.Println("Invalid command. Use: config <param> <value>")
+			continue
+		}
+
+		param, valueStr := parts[1], parts[2]
+		var config ProxyConfig
+
+		switch param {
+		case "client-drop":
+			val, err := strconv.ParseFloat(valueStr, 64)
+			if err != nil || val < 0 || val > 1 {
+				fmt.Println("Invalid value. Must be float between 0 and 1")
+				continue
+			}
+			config.PacketDropInbound = &val
+		case "server-drop":
+			val, err := strconv.ParseFloat(valueStr, 64)
+			if err != nil || val < 0 || val > 1 {
+				fmt.Println("Invalid value. Must be float between 0 and 1")
+				continue
+			}
+			config.PacketDropOutbound = &val
+		case "client-delay":
+			val, err := strconv.ParseFloat(valueStr, 64)
+			if err != nil || val < 0 || val > 1 {
+				fmt.Println("Invalid value. Must be float between 0 and 1")
+				continue
+			}
+			config.DelayInbound = &val
+		case "server-delay":
+			val, err := strconv.ParseFloat(valueStr, 64)
+			if err != nil || val < 0 || val > 1 {
+				fmt.Println("Invalid value. Must be float between 0 and 1")
+				continue
+			}
+			config.DelayOutbound = &val
+		case "client-delay-time":
+			val, err := strconv.ParseInt(valueStr, 10, 64)
+			if err != nil {
+				fmt.Println("Invalid value. Must be integer milliseconds")
+				continue
+			}
+			delayTime := time.Duration(val) * time.Millisecond
+			config.DelayTimeInbound = &delayTime
+		case "server-delay-time":
+			val, err := strconv.ParseInt(valueStr, 10, 64)
+			if err != nil {
+				fmt.Println("Invalid value. Must be integer milliseconds")
+				continue
+			}
+			delayTime := time.Duration(val) * time.Millisecond
+			config.DelayTimeOutbound = &delayTime
+		default:
+			fmt.Println("Unknown parameter")
+			continue
+		}
+
+		err := p.UpdateConfig(config)
+		if err != nil {
+			fmt.Println("Error updating configuration:", err)
+		} else {
+			fmt.Println("Configuration updated successfully")
+		}
 	}
 }
 
@@ -309,13 +457,30 @@ func main() {
 
 	case "proxy":
 		log.Println("Starting proxy")
-		proxy, err := NewProxyServer(*listenIP, *listenPort, *targetIP, *targetPort, *clientDrop, *serverDrop, *clientDelay, *serverDelay, time.Duration(*clientDelayTime)*time.Millisecond, time.Duration(*serverDelayTime)*time.Millisecond)
+		initialConfig := &ProxyConfig{
+			PacketDropInbound:  clientDrop,
+			PacketDropOutbound: serverDrop,
+			DelayInbound:       clientDelay,
+			DelayOutbound:      serverDelay,
+			DelayTimeInbound: func() *time.Duration {
+				t := time.Duration(*clientDelayTime) * time.Millisecond
+				return &t
+			}(),
+			DelayTimeOutbound: func() *time.Duration {
+				t := time.Duration(*serverDelayTime) * time.Millisecond
+				return &t
+			}(),
+		}
+		proxy, err := NewProxyServer(*listenIP, *listenPort, *targetIP, *targetPort, initialConfig)
 		if err != nil {
 			log.Fatal(err)
 		}
-
 		defer proxy.conn.Close()
 		defer proxy.targetConn.Close()
+
+		// Start configuration listener in a separate goroutine
+		go proxy.StartConfigListener()
+
 		proxy.Start()
 
 	default:
