@@ -80,6 +80,7 @@ func (c *Client) SendMessage(payload []byte) error {
 
 	encodedMsg := encodeMessage(msg)
 	for attempt := 0; attempt < c.maxRetries; attempt++ {
+		log.Printf("Starting attempt %d", attempt+1)
 		_, err := c.conn.Write(encodedMsg)
 		if err != nil {
 			return err
